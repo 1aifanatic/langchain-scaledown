@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -14,6 +15,7 @@ from langchain.agents.middleware import (
     AgentState,
     ModelRequest,
     ModelResponse,
+    ToolCallRequest,
 )
 from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
@@ -25,6 +27,8 @@ from langchain_core.messages import (
     get_buffer_string,
 )
 from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_json_schema
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import NotRequired
 
@@ -32,6 +36,7 @@ from langchain_scaledown._client import ScaledownAPIError, ScaledownClient
 
 if TYPE_CHECKING:
     from langgraph.runtime import Runtime
+    from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +390,231 @@ class ScaledownCompressionMiddleware(AgentMiddleware):
             )
             return await handler(request)
         return await handler(self._apply(request, response))
+
+
+DEFAULT_QUERY_DESCRIPTION = (
+    "Optional tool result compression. If you only need part of this tool's output, "
+    "describe what you are looking for, and the output will be compressed to the parts "
+    "relevant to it. Omit it, or set it to null, to get the full output."
+)
+
+
+def _is_text_only(message: ToolMessage) -> bool:
+    """Whether a tool result holds only text (`.text` would drop anything else)."""
+    content = message.content
+    return isinstance(content, str) or all(
+        isinstance(block, str) or block.get("type") == "text" for block in content
+    )
+
+
+class ScaledownToolCompressionMiddleware(AgentMiddleware):
+    """Let the model compress large tool results with ScaleDown's `sd_compress`.
+
+    Each targeted tool gets an extra optional string parameter (`compression_query`
+    by default) in the schema the model sees. When the model fills it in, the
+    middleware removes it from the arguments before the tool runs, then
+    compresses the tool's output relative to it. The tool itself is never
+    modified, so this works for any tool, including MCP and third-party tools.
+
+    The compressed result starts with a one-line note saying it was compressed
+    and how much, so the model can call the tool again without
+    `compression_query` if it needs the full output.
+
+    The tool result passes through unchanged when:
+
+    - the model leaves `compression_query` out, null, or empty,
+    - the output is not longer than `min_result_chars`,
+    - the result is an error, a `Command`, or holds non-text content (such as
+      images),
+    - ScaleDown reports `successful: False`, or
+    - the ScaleDown call raises `ScaledownAPIError` (fail open).
+
+    Args:
+        tools: Tools (or tool names) to add the parameter to. Defaults to every
+            tool the agent has.
+        param_name: Name of the added parameter. Raises `ValueError` on the
+            first model call if a targeted tool already has a parameter with
+            this name.
+        param_description: Description of the added parameter, shown to the
+            model.
+        min_result_chars: Only compress tool outputs longer than this.
+        rate: Compression rate passed to ScaleDown (`"auto"` by default).
+        client: Preconfigured `ScaledownClient`. If omitted, one is created from
+            `api_key` / `base_url` (or the `SCALEDOWN_API_KEY` /
+            `SCALEDOWN_BASE_URL` environment variables).
+
+    Example:
+        ```python
+        from langchain.agents import create_agent
+        from langchain_scaledown import ScaledownToolCompressionMiddleware
+
+        agent = create_agent(
+            "openai:gpt-6-luna",
+            tools=[search_docs, fetch_url],
+            middleware=[
+                ScaledownToolCompressionMiddleware(
+                    tools=["fetch_url"], min_result_chars=4000
+                )
+            ],
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        *,
+        tools: Sequence[str | BaseTool] | None = None,
+        param_name: str = "compression_query",
+        param_description: str = DEFAULT_QUERY_DESCRIPTION,
+        min_result_chars: int = 4000,
+        rate: Any = "auto",
+        client: ScaledownClient | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        super().__init__()
+        # Not `self.tools`: `AgentMiddleware.tools` registers extra tools.
+        self.tool_names = (
+            None
+            if tools is None
+            else {t if isinstance(t, str) else t.name for t in tools}
+        )
+        self.param_name = param_name
+        self.param_description = param_description
+        self.min_result_chars = min_result_chars
+        self.rate = rate
+        self.client = _resolve_client(client, api_key, base_url)
+
+    def _targets(self, name: str) -> bool:
+        return self.tool_names is None or name in self.tool_names
+
+    def _augment(self, tool: BaseTool) -> dict[str, Any]:
+        schema = copy.deepcopy(convert_to_json_schema(tool))
+        properties = schema.setdefault("properties", {})
+        if self.param_name in properties:
+            raise ValueError(
+                f"Tool {tool.name!r} already has a {self.param_name!r} parameter. "
+                "Pass a different `param_name` to ScaledownToolCompressionMiddleware."
+            )
+        # Nullable rather than just optional: OpenAI strict mode makes every
+        # parameter required, so null is how the model opts out there.
+        properties[self.param_name] = {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": self.param_description,
+        }
+        return schema
+
+    def _with_schemas(self, request: ModelRequest) -> ModelRequest:
+        tools = [
+            self._augment(t) if isinstance(t, BaseTool) and self._targets(t.name) else t
+            for t in request.tools
+        ]
+        return request.override(tools=tools)
+
+    def _split(self, request: ToolCallRequest) -> tuple[ToolCallRequest, str | None]:
+        """Remove the compression query from the call, returning it separately."""
+        call = request.tool_call
+        if not self._targets(call["name"]) or self.param_name not in call["args"]:
+            return request, None
+        args = dict(call["args"])
+        query = args.pop(self.param_name)
+        request = request.override(tool_call={**call, "args": args})
+        if not isinstance(query, str) or not query.strip():
+            return request, None
+        return request, query.strip()
+
+    def _compressible(
+        self, result: ToolMessage | Command[Any], query: str | None
+    ) -> tuple[ToolMessage, str, str] | None:
+        """The message, its text and the query, if the result should be compressed."""
+        if query is None or not isinstance(result, ToolMessage):
+            return None
+        if result.status == "error":
+            return None
+        if not _is_text_only(result):
+            return None
+        text = result.text
+        if len(text) <= self.min_result_chars:
+            return None
+        return result, text, query
+
+    def _apply(
+        self, message: ToolMessage, text: str, query: str, response: dict[str, Any]
+    ) -> ToolMessage:
+        compressed = response.get("compressed_prompt")
+        if not response.get("successful") or not isinstance(compressed, str):
+            logger.warning(
+                "ScaleDown tool result compression unsuccessful; keeping full output."
+            )
+            return message
+        note = (
+            f"[Compressed by ScaleDown for {json.dumps(query, ensure_ascii=False)}: "
+            f"{len(text):,} -> {len(compressed):,} chars. Call this tool again "
+            f"without `{self.param_name}` for the full output.]"
+        )
+        return message.model_copy(update={"content": f"{note}\n\n{compressed}"})
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Add the compression query parameter to the targeted tools' schemas."""
+        return handler(self._with_schemas(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """Async version of `wrap_model_call`."""
+        return await handler(self._with_schemas(request))
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        """Run the tool without the compression query, then compress its output."""
+        request, query = self._split(request)
+        result = handler(request)
+        target = self._compressible(result, query)
+        if target is None:
+            return result
+        message, text, query = target
+        try:
+            response = self.client.compress(text, query, rate=self.rate)
+        except ScaledownAPIError:
+            logger.warning(
+                "ScaleDown tool result compression failed; keeping full output.",
+                exc_info=True,
+            )
+            return result
+        return self._apply(message, text, query, response)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        """Async version of `wrap_tool_call`."""
+        request, query = self._split(request)
+        result = await handler(request)
+        target = self._compressible(result, query)
+        if target is None:
+            return result
+        message, text, query = target
+        try:
+            response = await asyncio.to_thread(
+                self.client.compress, text, query, rate=self.rate
+            )
+        except ScaledownAPIError:
+            logger.warning(
+                "ScaleDown tool result compression failed; keeping full output.",
+                exc_info=True,
+            )
+            return result
+        return self._apply(message, text, query, response)
 
 
 EXTRACTION_STATE_KEY = "scaledown_extraction"

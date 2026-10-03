@@ -5,6 +5,7 @@ from langchain_scaledown.middleware import (
     ScaledownCompressionMiddleware,
     ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
+    ScaledownToolCompressionMiddleware,
 )
 
 try:
@@ -20,5 +21,6 @@ __all__ = [
     "ScaledownCompressionMiddleware",
     "ScaledownExtractionMiddleware",
     "ScaledownSummarizationMiddleware",
+    "ScaledownToolCompressionMiddleware",
     "__version__",
 ]

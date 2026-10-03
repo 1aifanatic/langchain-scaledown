@@ -19,13 +19,16 @@ the `SCALEDOWN_API_KEY` you provide. Each middleware sends only the text it need
 - **Compresses**: `ScaledownCompressionMiddleware` shrinks large retrieved context before
   each model call, relative to the user's question. LangChain has no built-in equivalent.
   - `sd_compress`: reduces context tokens 50–70% before your LLM call (for RAG, long docs)
+- **Compresses tool results on request**: `ScaledownToolCompressionMiddleware` gives
+  your tools an optional `compression_query` parameter. When the model says what it's looking for,
+  the tool's output is compressed down to the relevant parts before the model sees it.
 - **Extracts**: `ScaledownExtractionMiddleware` turns a conversation into a structured
   record as it happens, such as a support ticket with the order number, error message,
   sentiment and issue type.
   - `sd_extract`: replaces frontier LLM entity extraction calls (~95% cheaper)
   - `sd_classify`: used automatically for label fields like sentiment and issue type
 
-All three **fail open**. If ScaleDown is unreachable, out of credits, or rejects a
+All four **fail open**. If ScaleDown is unreachable, out of credits, or rejects a
 request, the agent keeps running as if the middleware weren't there, and a warning is
 logged.
 
@@ -90,6 +93,7 @@ result["scaledown_extraction"]["fields"]
 |---|---|---|---|
 | `ScaledownSummarizationMiddleware` | `sd_summarize` | Before a model call, once the conversation passes `trigger` | Replaces older messages in agent state with one summary message |
 | `ScaledownCompressionMiddleware` | `sd_compress` | Before each model call, when context is over `min_context_chars` | Replaces the system message sent to the model with a compressed version |
+| `ScaledownToolCompressionMiddleware` | `sd_compress` | After a tool call where the model set `compression_query`, when the output is over `min_result_chars` | Adds `compression_query` to tool schemas; replaces the tool result with a compressed version |
 | `ScaledownExtractionMiddleware` | `sd_extract` + `sd_classify` | Once per agent run, before the first model call | Adds a `scaledown_extraction` record to agent state; optionally shows it to the model |
 
 ### Summarization (`sd_summarize`)
@@ -134,6 +138,39 @@ agent = create_agent(
 Pass `context_extractor=` to choose what gets compressed. It's a function
 `(request) -> (context, prompt)` that returns `None` to skip. The compressed context
 always replaces the system message.
+
+### Tool result compression (`sd_compress`)
+
+Adds an optional `compression_query` parameter to your tools' schemas. The model fills it in when it
+only needs part of a tool's output, for example `fetch_url(url=..., compression_query="refund
+policy for EU orders")`. The middleware removes `compression_query` before the tool runs, so your tools
+don't change. It then compresses the output relative to `compression_query`. This works for any
+tool, including MCP and third-party tools.
+
+```python
+from langchain_scaledown import ScaledownToolCompressionMiddleware
+
+agent = create_agent(
+    "openai:gpt-6-luna",
+    tools=[search_docs, fetch_url, *mcp_tools],
+    middleware=[
+        ScaledownToolCompressionMiddleware(
+            tools=["fetch_url"],     # default: every tool
+            min_result_chars=4000,   # leave shorter outputs alone
+        )
+    ],
+)
+```
+
+The compressed result starts with a note like
+`[Compressed by ScaleDown for "refund policy for EU orders": 18,402 -> 3,110 chars. ...]`,
+so the model can call the tool again without `compression_query` if it needs the full output.
+Error results, `Command` results, and results with non-text content (such as images)
+are never compressed.
+
+> **Watch for name clashes.** Search tools often already have a `query` parameter, which
+> is why the added one is called `compression_query`. Rename it with `param_name=`. The middleware
+> raises `ValueError` if a targeted tool already has a parameter with that name.
 
 ### Extraction (`sd_extract` + `sd_classify`)
 
@@ -297,6 +334,7 @@ guessing an address. The agent's callback note asks the team to confirm it.
 |---|---|---|
 | Summarization | The older messages being summarized | `/summarization/abstractive` |
 | Compression | The system message and the latest user message | `/compress/raw/` |
+| Tool result compression | The tool's output and the model's `compression_query`, only when the model sets it | `/compress/raw/` |
 | Extraction | The user's messages (not the agent's replies) and your schema | `/extract` |
 
 ## Configuration
