@@ -109,6 +109,41 @@ ScaledownSummarizationMiddleware(
 )
 ```
 
+#### `ScaledownSummarizer` with LangChain and Deep Agents
+
+`ScaledownSummarizer` plugs ScaleDown into the existing summarization middleware via its
+`summarizer` argument. The middleware still decides when to summarize and what to keep
+(including fractional limits from the model profile); ScaleDown writes the summary in
+place of a second LLM call. It accepts a string or a list of messages.
+
+By default it asks ScaleDown for the same sections as LangChain's summary prompt
+(session intent, summary, artifacts, next steps); pass `instructions=` to change that.
+
+```python
+from langchain.agents.middleware import SummarizationMiddleware
+from langchain_scaledown import ScaledownSummarizer
+
+SummarizationMiddleware(
+    "openai:gpt-6-luna",              # used for its profile and token counting
+    trigger=("fraction", 0.8),
+    keep=("fraction", 0.1),
+    trim_tokens_to_summarize=None,    # send all older history to ScaleDown
+    summarizer=ScaledownSummarizer(),
+)
+```
+
+With Deep Agents, build the summarization middleware with the same summarizer. It keeps
+the name `SummarizationMiddleware`, so it replaces the default (history offloading,
+argument truncation and the `compact_conversation` tool keep working):
+
+```python
+from deepagents import create_deep_agent
+from deepagents.middleware.summarization import create_summarization_middleware
+
+summarization = create_summarization_middleware(model, backend, summarizer=ScaledownSummarizer())
+agent = create_deep_agent(model=model, backend=backend, middleware=[summarization])
+```
+
 > **Note:** `sd_summarize` is in private preview. Contact ScaleDown to enable it on your key.
 
 ### Compression (`sd_compress`)
