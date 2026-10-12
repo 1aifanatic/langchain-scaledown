@@ -50,11 +50,12 @@ class Spy(AgentMiddleware):
 
 def run_summarization(use_async: bool) -> None:
     spy = Spy()
+    model = FakeListChatModel(responses=["final answer", "follow-up answer"])
     agent = create_agent(
-        model=FakeListChatModel(responses=["final answer", "follow-up answer"]),
+        model=model,
         middleware=[
             ScaledownSummarizationMiddleware(
-                trigger=("messages", 6), keep=("messages", 2)
+                model, trigger=("messages", 6), keep=("messages", 2)
             ),
             spy,
         ],

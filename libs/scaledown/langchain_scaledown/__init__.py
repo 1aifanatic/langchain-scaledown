@@ -6,6 +6,7 @@ from langchain_scaledown.middleware import (
     ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
 )
+from langchain_scaledown.summarizer import ScaledownSummarizer
 
 try:
     __version__ = metadata.version(__package__)
@@ -20,5 +21,6 @@ __all__ = [
     "ScaledownCompressionMiddleware",
     "ScaledownExtractionMiddleware",
     "ScaledownSummarizationMiddleware",
+    "ScaledownSummarizer",
     "__version__",
 ]
