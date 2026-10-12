@@ -6,6 +6,7 @@ hand-rolled against a fake `ModelRequest`.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -636,6 +637,15 @@ class TestToolCompression:
 # ScaledownExtractionMiddleware
 # --------------------------------------------------------------------------
 
+
+def chat_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a task result in the OpenAI chat.completion envelope."""
+    return {
+        "object": "chat.completion",
+        "choices": [{"message": {"role": "assistant", "content": json.dumps(result)}}],
+    }
+
+
 TICKET_ENTITIES: dict[str, Any] = {
     "order_id": "Order number the customer mentions",
     "error_message": "Exact error message the customer saw",
@@ -649,12 +659,19 @@ EXTRACT_RESPONSE: dict[str, Any] = {
         {"text": "A-1042", "type": "order_id", "confidence": 0.97},
         {"text": "A-9", "type": "order_id", "confidence": 0.41},
         {"text": "ERR_PAYMENT_DECLINED", "type": "error_message", "confidence": 0.9},
-        {"text": "billing", "type": "issue_type", "confidence": 0.93},
-        {"text": "frustrated", "type": "sentiment", "confidence": 0.88},
         {"text": "ignored", "type": "not_in_schema", "confidence": 0.99},
     ],
     "structured_result": None,
     "ocr_text": None,
+}
+
+CLASSIFY_RESPONSE: dict[str, Any] = {
+    "model": "classify-1",
+    "answers": {
+        "issue_type": {"type": "choice", "choice": "billing", "confidence": 0.93},
+        "sentiment": {"type": "choice", "choice": "frustrated", "confidence": 0.88},
+    },
+    "usage": {"input_tokens": 10, "output_tokens": 2, "cost": 0.0},
 }
 
 
@@ -676,17 +693,46 @@ class TestExtraction:
             context_chars=0,
             client=client,
         )
-        with patch.object(
-            ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
-        ) as extract:
+        with (
+            patch.object(
+                ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
+            ) as extract,
+            patch.object(
+                ScaledownClient, "classify", return_value=CLASSIFY_RESPONSE
+            ) as classify,
+        ):
             update = mw.before_agent({"messages": support_chat()}, MagicMock())
 
         extract.assert_called_once()
+        classify.assert_called_once()
+        # Classification keys go to the Decisions API as choice questions.
+        assert classify.call_args.args[1] == {
+            "issue_type": {
+                "type": "choice",
+                "criteria": {
+                    "billing": "billing",
+                    "technical": "technical",
+                    "account": "account",
+                },
+            },
+            "sentiment": {
+                "type": "choice",
+                "criteria": {
+                    "frustrated": "frustrated",
+                    "neutral": "neutral",
+                    "satisfied": "satisfied",
+                },
+            },
+        }
+        assert "fed up" in classify.call_args.args[0]
         text = extract.call_args.args[0]
         assert "A-1042" in text and "fed up" in text
         # The agent's own words are never extraction input.
         assert "A-9999" not in text
-        assert extract.call_args.args[1] == TICKET_ENTITIES
+        # Only extractive fields go to extract.
+        assert extract.call_args.args[1] == {
+            k: v for k, v in TICKET_ENTITIES.items() if "labels" not in v
+        }
         assert extract.call_args.kwargs == {
             "instruction": "one value per field",
             "threshold": 0.3,
@@ -703,7 +749,44 @@ class TestExtraction:
             "issue_type": "billing",
             "sentiment": "frustrated",
         }
-        assert record["entities"] == EXTRACT_RESPONSE["entities"]
+        assert record["entities"] == [
+            *EXTRACT_RESPONSE["entities"],
+            {"text": "billing", "type": "issue_type", "confidence": 0.93},
+            {"text": "frustrated", "type": "sentiment", "confidence": 0.88},
+        ]
+
+    def test_label_rubrics_and_description(self, client: ScaledownClient) -> None:
+        entities = {
+            "issue_type": {
+                "description": "What the ticket is about",
+                "labels": [
+                    {"name": "billing", "rubric": "A charge or payment"},
+                    {"name": "technical"},
+                ],
+            }
+        }
+        mw = ScaledownExtractionMiddleware(entities, client=client)
+        response = {"answers": {"issue_type": {"choice": "billing", "confidence": 1}}}
+        with (
+            patch.object(ScaledownClient, "extract") as extract,
+            patch.object(
+                ScaledownClient, "classify", return_value=response
+            ) as classify,
+        ):
+            update = mw.before_agent({"messages": support_chat()}, MagicMock())
+        extract.assert_not_called()  # no extractive fields, so no extract call
+        assert classify.call_args.args[1] == {
+            "issue_type": {
+                "type": "choice",
+                "instructions": "What the ticket is about",
+                "criteria": {
+                    "billing": "A charge or payment",
+                    "technical": "technical",
+                },
+            }
+        }
+        assert update is not None
+        assert update["scaledown_extraction"]["fields"] == {"issue_type": "billing"}
 
     def test_structured_result_merged(self, client: ScaledownClient) -> None:
         entities = {
@@ -744,9 +827,12 @@ class TestExtraction:
             TICKET_ENTITIES, text_builder=builder, client=client
         )
         messages = support_chat()
-        with patch.object(
-            ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
-        ) as extract:
+        with (
+            patch.object(
+                ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
+            ) as extract,
+            patch.object(ScaledownClient, "classify", return_value=CLASSIFY_RESPONSE),
+        ):
             mw.before_agent({"messages": messages}, MagicMock())
         builder.assert_called_once_with(messages)
         assert extract.call_args.args[0] == "custom text"
@@ -761,9 +847,12 @@ class TestExtraction:
 
     async def test_async_extracts(self, client: ScaledownClient) -> None:
         mw = ScaledownExtractionMiddleware(TICKET_ENTITIES, client=client)
-        with patch.object(
-            ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
-        ) as extract:
+        with (
+            patch.object(
+                ScaledownClient, "extract", return_value=EXTRACT_RESPONSE
+            ) as extract,
+            patch.object(ScaledownClient, "classify", return_value=CLASSIFY_RESPONSE),
+        ):
             update = await mw.abefore_agent({"messages": support_chat()}, MagicMock())
         extract.assert_called_once()
         assert update is not None
@@ -908,14 +997,24 @@ class TestClient:
 
     def test_summarize_request_shape(self, client: ScaledownClient) -> None:
         with patch("langchain_scaledown._client.requests.post") as post:
-            post.return_value.json.return_value = {"summary": "short"}
-            assert client.summarize("long text", max_tokens=10) == "short"
+            post.return_value.json.return_value = chat_response({"summary": "short"})
+            assert (
+                client.summarize("long text", instructions="be brief", max_tokens=10)
+                == "short"
+            )
         url = post.call_args.args[0]
         kw = post.call_args.kwargs
-        assert url == "https://api.scaledown.xyz/summarization/abstractive"
+        assert url == "https://api.scaledown.xyz/v1/chat/completions"
         assert kw["headers"]["x-api-key"] == "test-key"
         assert "Authorization" not in kw["headers"]
-        assert kw["json"] == {"text": "long text", "max_tokens": 10}
+        assert kw["json"] == {
+            "model": "summarize",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "long text"},
+            ],
+            "max_tokens": 10,
+        }
 
     def test_compress_request_shape(self, client: ScaledownClient) -> None:
         with patch("langchain_scaledown._client.requests.post") as post:
@@ -929,17 +1028,39 @@ class TestClient:
         }
 
     def test_extract_request_shape(self, client: ScaledownClient) -> None:
-        entities = {"order_id": "Order number", "mood": {"labels": ["a", "b"]}}
+        entities = {"order_id": "Order number"}
+        result = {"entities": []}
         with patch("langchain_scaledown._client.requests.post") as post:
-            post.return_value.json.return_value = {"entities": []}
-            assert client.extract("text", entities, threshold=0.2) == {"entities": []}
-        assert post.call_args.args[0] == "https://api.scaledown.xyz/extract"
+            post.return_value.json.return_value = chat_response(result)
+            assert client.extract("text", entities, threshold=0.2) == result
+        assert post.call_args.args[0] == "https://api.scaledown.xyz/v1/chat/completions"
         # Unset optional params are omitted so the API defaults apply.
         assert post.call_args.kwargs["json"] == {
-            "text": "text",
+            "model": "extract",
+            "messages": [{"role": "user", "content": "text"}],
             "entities": entities,
             "threshold": 0.2,
         }
+
+    def test_classify_request_shape(self, client: ScaledownClient) -> None:
+        questions = {"mood": {"type": "choice", "criteria": {"a": "A", "b": "B"}}}
+        response = {"answers": {"mood": {"choice": "a", "confidence": 0.9}}}
+        with patch("langchain_scaledown._client.requests.post") as post:
+            post.return_value.json.return_value = response
+            assert client.classify("text", questions) == response
+        assert post.call_args.args[0] == "https://api.scaledown.xyz/v1/scaledown"
+        assert post.call_args.kwargs["headers"]["x-api-key"] == "test-key"
+        assert post.call_args.kwargs["json"] == {
+            "model": "classify-1",
+            "state": {"text": "text"},
+            "questions": questions,
+        }
+
+    def test_malformed_chat_response(self, client: ScaledownClient) -> None:
+        with patch("langchain_scaledown._client.requests.post") as post:
+            post.return_value.json.return_value = {"choices": []}
+            with pytest.raises(ScaledownAPIError):
+                client.summarize("text")
 
     def test_compress_reads_nested_results(self, client: ScaledownClient) -> None:
         # The live API nests the output under "results".

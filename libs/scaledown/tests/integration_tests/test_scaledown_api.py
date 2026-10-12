@@ -68,6 +68,26 @@ def test_extract(client: ScaledownClient) -> None:
     assert found["sentiment"] in {"frustrated", "neutral", "satisfied"}
 
 
+def test_classify(client: ScaledownClient) -> None:
+    response = client.classify(
+        TICKET_TEXT,
+        {
+            "sentiment": {
+                "type": "choice",
+                "criteria": {
+                    "frustrated": "The customer is upset or annoyed",
+                    "neutral": "The customer is matter-of-fact",
+                    "satisfied": "The customer is happy",
+                },
+            }
+        },
+    )
+    answer = response["answers"]["sentiment"]
+    assert answer["choice"] in {"frustrated", "neutral", "satisfied"}
+    assert answer["choice"] == "frustrated"
+    assert 0 <= answer["confidence"] <= 1
+
+
 def test_compress(client: ScaledownClient) -> None:
     response = client.compress(DOCS, "How long is the refund window?")
     assert response["successful"] is True, response

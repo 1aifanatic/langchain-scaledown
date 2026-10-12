@@ -222,7 +222,7 @@ are never compressed.
 ### Extraction (`sd_extract` + `sd_classify`)
 
 Turns a conversation into a structured record. One schema holds two kinds of fields,
-and ScaleDown handles both in a single call:
+and ScaleDown handles both, extraction through the OpenAI-compatible API and classification through the Decisions API:
 
 | Field type | Schema | Value | Good for |
 |---|---|---|---|
@@ -379,10 +379,10 @@ guessing an address. The agent's callback note asks the team to confirm it.
 
 | Middleware | Sent to ScaleDown | Endpoint |
 |---|---|---|
-| Summarization | The older messages being summarized | `/summarization/abstractive` |
+| Summarization | The older messages being summarized | `/v1/chat/completions` (`model: summarize`) |
 | Compression | The system message and the latest user message | `/compress/raw/` |
 | Tool result compression | The tool's output and the model's `compression_query`, only when the model sets it | `/compress/raw/` |
-| Extraction | The user's messages (not the agent's replies) and your schema | `/extract` |
+| Extraction | The user's messages (not the agent's replies) and your schema | `/v1/chat/completions` (`model: extract`) for extractive fields, `/v1/scaledown` (Decisions API) for classification keys |
 
 ## Configuration
 

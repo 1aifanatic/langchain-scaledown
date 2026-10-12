@@ -559,8 +559,32 @@ def _format_value(value: Any) -> str:
     return encoded.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
+def _is_classification(config: Any) -> bool:
+    """Whether an entity config is a classification key (has a `labels` list)."""
+    return isinstance(config, Mapping) and isinstance(config.get("labels"), list)
+
+
+def _choice_question(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a Decisions API `choice` question from a classification key.
+
+    Labels are strings or `{"name", "rubric"}` objects; a plain string is its
+    own rubric.
+    """
+    criteria: dict[str, str] = {}
+    for label in config["labels"]:
+        if isinstance(label, Mapping):
+            name = str(label["name"])
+            criteria[name] = str(label.get("rubric") or name)
+        else:
+            criteria[str(label)] = str(label)
+    question: dict[str, Any] = {"type": "choice", "criteria": criteria}
+    if config.get("description"):
+        question["instructions"] = str(config["description"])
+    return question
+
+
 class ScaledownExtractionMiddleware(AgentMiddleware):
-    """Pull structured fields out of the conversation with ScaleDown's `/extract`.
+    """Pull structured fields out of the conversation with ScaleDown.
 
     Once per agent invocation, before the first model call, the user's messages
     are sent to ScaleDown with your `entities` schema. The result is stored in
@@ -580,13 +604,14 @@ class ScaledownExtractionMiddleware(AgentMiddleware):
     list from ScaleDown, with confidence scores and evidence context.
     Character offsets refer to the text built by `text_builder`.
 
-    Fields come in two kinds, and both are handled in the same `/extract` call:
+    Fields come in two kinds. Extractive fields use the OpenAI-compatible extract
+    task, and classification keys use the Decisions API (`/v1/scaledown`):
 
     - **Extractive fields** (a description string, or an object with
       `description`): the value is a span copied verbatim from the text, such
       as an order number, an error message, or an email address.
-    - **Classification keys** (an object with a `labels` list): ScaleDown routes
-      these to its classification model and returns one of your labels. Use
+    - **Classification keys** (an object with a `labels` list): each becomes a
+      `choice` question, and ScaleDown returns one of your labels. Use
       them for decisions such as sentiment or issue type, where there's no
       verbatim span to copy.
 
@@ -596,7 +621,8 @@ class ScaledownExtractionMiddleware(AgentMiddleware):
     normally, and the previous extraction (if any) stays in state.
 
     Args:
-        entities: The ScaleDown `/extract` entity schema, passed through as is.
+        entities: The ScaleDown extract entity schema. Extractive fields are passed
+            through as is; classification keys are sent to the Decisions API.
         text_builder: Builds the text to extract from, given the conversation
             messages. Defaults to the text of the user's (`HumanMessage`)
             messages only, so extracted values are always things the user
@@ -666,14 +692,46 @@ class ScaledownExtractionMiddleware(AgentMiddleware):
         self.client = _resolve_client(client, api_key, base_url)
 
     def _call_extract(self, text: str) -> dict[str, Any]:
-        return self.client.extract(
-            text,
-            self.entities,
-            instruction=self.instruction,
-            threshold=self.threshold,
-            top_n=self.top_n,
-            context_chars=self.context_chars,
-        )
+        """Extract span fields and classify label fields, as one response.
+
+        Extractive fields go to the OpenAI-compatible extract task and
+        classification keys go to the Decisions API. Each decision is merged
+        into the extract response as an entity of that key.
+        """
+        extractive = {
+            k: v for k, v in self.entities.items() if not _is_classification(v)
+        }
+        questions = {
+            k: _choice_question(v)
+            for k, v in self.entities.items()
+            if _is_classification(v)
+        }
+        response: dict[str, Any] = {"entities": []}
+        if extractive:
+            response = self.client.extract(
+                text,
+                extractive,
+                instruction=self.instruction,
+                threshold=self.threshold,
+                top_n=self.top_n,
+                context_chars=self.context_chars,
+            )
+        if questions:
+            answers = self.client.classify(text, questions).get("answers") or {}
+            decided = [
+                {
+                    "text": answer["choice"],
+                    "type": key,
+                    "confidence": answer.get("confidence"),
+                }
+                for key, answer in answers.items()
+                if isinstance(answer, dict) and answer.get("choice") is not None
+            ]
+            response = {
+                **response,
+                "entities": [*(response.get("entities") or []), *decided],
+            }
+        return response
 
     def _to_record(self, response: dict[str, Any]) -> dict[str, Any]:
         fields: dict[str, Any] = dict.fromkeys(self.entities)
