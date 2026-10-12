@@ -144,7 +144,7 @@ TICKET_ENTITIES = {
 
 
 def extract_response(text, entities, **kwargs):
-    """Fake /extract: returns only spans that are actually present in `text`."""
+    """Fake extract task: returns only spans that are actually present in `text`."""
     found = [
         ("A-1042", "order_id"),
         ("ERR_PAYMENT_DECLINED", "error_message"),
@@ -155,11 +155,17 @@ def extract_response(text, entities, **kwargs):
         for value, key in found
         if value in text
     ]
-    spans += [
-        {"text": "billing", "type": "issue_type", "confidence": 0.93},
-        {"text": "frustrated", "type": "sentiment", "confidence": 0.9},
-    ]
     return {"entities": spans, "structured_result": None, "ocr_text": None}
+
+
+def classify_response(text, questions):
+    """Fake Decisions API: picks a fixed label for each question."""
+    picks = {"issue_type": "billing", "sentiment": "frustrated"}
+    answers = {
+        key: {"type": "choice", "choice": picks[key], "confidence": 0.9}
+        for key in questions
+    }
+    return {"model": "classify-1", "answers": answers}
 
 
 def run_extraction(use_async: bool) -> None:
@@ -200,9 +206,12 @@ def run_extraction(use_async: bool) -> None:
         "Order A-1042 failed with ERR_PAYMENT_DECLINED. Third time, I'm fed up.",
         "It's jane@example.com",
     ]
-    with patch.object(
-        ScaledownClient, "extract", side_effect=extract_response
-    ) as extract:
+    with (
+        patch.object(
+            ScaledownClient, "extract", side_effect=extract_response
+        ) as extract,
+        patch.object(ScaledownClient, "classify", side_effect=classify_response),
+    ):
         results = []
         for turn in turns:
             inputs = {"messages": [HumanMessage(turn)]}
