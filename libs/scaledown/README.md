@@ -96,28 +96,34 @@ result["scaledown_extraction"]["fields"]
 
 ### Summarization (`sd_summarize`)
 
-A drop-in for LangChain's built-in
-[`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware/built-in#summarization),
-with the same `trigger` / `keep` options. When the conversation crosses `trigger`,
-every message except the most recent ones selected by `keep` is replaced in state by a
-single ScaleDown summary. Each stretch of history is summarized once. Tool results are
-never separated from the call that requested them.
-
-Pass your agent's model. It's used for its context window (for `"fraction"` limits) and
-for token counting, never to write summaries.
+Pass a `ScaledownSummarizer` to LangChain's built-in
+[`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware/built-in#summarization).
+The middleware still decides when to summarize and which recent messages to keep;
+ScaleDown writes the summary instead of a second LLM call.
 
 ```python
-ScaledownSummarizationMiddleware(
+from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
+from langchain_scaledown import ScaledownSummarizer
+
+agent = create_agent(
     "openai:gpt-6-sol",
-    trigger=("fraction", 0.8),  # or ("tokens", 4000), ("messages", 50), or a list of these
-    keep=("fraction", 0.1),     # or ("messages", 20), ("tokens", 2000)
-    instructions="Keep order numbers and dates.",  # optional, passed to ScaleDown
+    tools=[...],
+    middleware=[
+        SummarizationMiddleware(
+            "openai:gpt-6-sol",             # used for its context window and token counting
+            trigger=("fraction", 0.8),
+            keep=("fraction", 0.1),
+            trim_tokens_to_summarize=None,  # send all older history to ScaleDown
+            summarizer=ScaledownSummarizer(),
+        )
+    ],
 )
 ```
 
 By default ScaleDown is asked for the same sections as LangChain's summary prompt
-(session intent, summary, artifacts, next steps), and all of the older history is sent
-(`trim_tokens_to_summarize=None`).
+(session intent, summary, artifacts, next steps). Pass
+`ScaledownSummarizer(instructions=...)` to change that.
 
 #### With Deep Agents
 
