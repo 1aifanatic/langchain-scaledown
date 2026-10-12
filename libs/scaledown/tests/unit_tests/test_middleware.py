@@ -10,6 +10,9 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -19,7 +22,13 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.tools import StructuredTool
+from langchain_core.utils.function_calling import (
+    convert_to_json_schema,
+    convert_to_openai_tool,
+)
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Command
 
 from langchain_scaledown import (
     ScaledownAPIError,
@@ -27,6 +36,7 @@ from langchain_scaledown import (
     ScaledownCompressionMiddleware,
     ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
+    ScaledownToolCompressionMiddleware,
 )
 from langchain_scaledown.summarizer import DEFAULT_INSTRUCTIONS
 
@@ -355,6 +365,271 @@ class TestCompression:
         ):
             sent = await mw.awrap_model_call(request, handler)
         assert sent is request
+
+
+# --------------------------------------------------------------------------
+# ScaledownToolCompressionMiddleware
+# --------------------------------------------------------------------------
+
+BIG_RESULT = "Refund window: 30 days. " + ("unrelated page text. " * 300)
+
+
+@tool
+def fetch_page(url: str, runtime: ToolRuntime) -> str:
+    """Fetch a web page."""
+    return BIG_RESULT
+
+
+@tool
+def search(query: str) -> str:
+    """Search the docs."""
+    return BIG_RESULT
+
+
+def make_model_request(tools: list[Any]) -> MagicMock:
+    request = MagicMock(name="ModelRequest")
+    request.tools = tools
+    request.override = MagicMock(
+        side_effect=lambda **kw: make_model_request(kw.get("tools", request.tools))
+    )
+    return request
+
+
+def make_tool_request(name: str, args: dict[str, Any]) -> ToolCallRequest:
+    return ToolCallRequest(
+        tool_call={"name": name, "args": args, "id": "call-1", "type": "tool_call"},
+        tool=None,
+        state={"messages": []},
+        runtime=MagicMock(),
+    )
+
+
+def tool_result(content: Any = BIG_RESULT, **kw: Any) -> ToolMessage:
+    return ToolMessage(content=content, tool_call_id="call-1", name="fetch_page", **kw)
+
+
+COMPRESSED = {"successful": True, "compressed_prompt": "Refund window: 30 days."}
+
+
+class TestToolCompression:
+    def test_adds_query_to_targeted_tool_schemas(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(tools=[fetch_page], client=client)
+        builtin = {"type": "web_search"}
+        request = make_model_request([fetch_page, search, builtin])
+        handler = MagicMock()
+        mw.wrap_model_call(request, handler)
+
+        fetch_schema, search_tool, builtin_tool = handler.call_args.args[0].tools
+        assert fetch_schema["title"] == "fetch_page"
+        assert set(fetch_schema["properties"]) == {"url", "compression_query"}
+        assert fetch_schema["required"] == ["url"]
+        strict = convert_to_openai_tool(fetch_schema, strict=True)["function"]
+        assert strict["parameters"]["required"] == ["url", "compression_query"]
+        assert strict["parameters"]["properties"]["compression_query"]["anyOf"] == [
+            {"type": "string"},
+            {"type": "null"},
+        ]
+        assert search_tool is search
+        assert builtin_tool is builtin
+        # The tool's own schema is not modified.
+        assert (
+            "compression_query" not in convert_to_json_schema(fetch_page)["properties"]
+        )
+
+    def test_defaults_to_all_tools(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(
+            param_name="compress_for", client=client
+        )
+        handler = MagicMock()
+        mw.wrap_model_call(make_model_request([fetch_page, search]), handler)
+        tools = handler.call_args.args[0].tools
+        assert all("compress_for" in t["properties"] for t in tools)
+
+    def test_dict_args_schema_is_not_mutated(self, client: ScaledownClient) -> None:
+        args_schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+        mcp_tool = StructuredTool(
+            name="mcp_search",
+            description="MCP search.",
+            args_schema=args_schema,
+            func=lambda **kw: BIG_RESULT,
+        )
+        mw = ScaledownToolCompressionMiddleware(client=client)
+        handler = MagicMock()
+        mw.wrap_model_call(make_model_request([mcp_tool]), handler)
+        assert "compression_query" in handler.call_args.args[0].tools[0]["properties"]
+        assert set(args_schema["properties"]) == {"q"}
+
+    def test_name_collision_raises(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(param_name="query", client=client)
+        with pytest.raises(ValueError, match="already has a 'query' parameter"):
+            mw.wrap_model_call(make_model_request([search]), MagicMock())
+
+    def test_compresses_result_with_query(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(rate=0.4, client=client)
+        request = make_tool_request(
+            "fetch_page", {"url": "u", "compression_query": " refunds "}
+        )
+        handler = MagicMock(return_value=tool_result(artifact={"raw": 1}))
+        with patch.object(ScaledownClient, "compress", return_value=COMPRESSED) as c:
+            result = mw.wrap_tool_call(request, handler)
+
+        # The tool runs without the compression query argument.
+        assert handler.call_args.args[0].tool_call["args"] == {"url": "u"}
+        assert request.tool_call["args"] == {
+            "url": "u",
+            "compression_query": " refunds ",
+        }
+        c.assert_called_once_with(BIG_RESULT, "refunds", rate=0.4)
+        assert isinstance(result, ToolMessage)
+        assert result.text.startswith('[Compressed by ScaleDown for "refunds": ')
+        assert "without `compression_query` for the full output" in result.text
+        assert result.text.endswith("\n\nRefund window: 30 days.")
+        assert result.tool_call_id == "call-1"
+        assert result.artifact == {"raw": 1}
+
+    def test_text_blocks_are_compressed(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(min_result_chars=10, client=client)
+        request = make_tool_request(
+            "fetch_page", {"url": "u", "compression_query": "refunds"}
+        )
+        blocks = [{"type": "text", "text": "part one, "}, "part two"]
+        handler = MagicMock(return_value=tool_result(blocks))
+        with patch.object(ScaledownClient, "compress", return_value=COMPRESSED) as c:
+            mw.wrap_tool_call(request, handler)
+        assert c.call_args.args[0] == "part one, part two"
+
+    @pytest.mark.parametrize(
+        ("args", "result"),
+        [
+            ({"url": "u"}, tool_result()),
+            ({"url": "u", "compression_query": None}, tool_result()),
+            ({"url": "u", "compression_query": "  "}, tool_result()),
+            ({"url": "u", "compression_query": 3}, tool_result()),
+            ({"url": "u", "compression_query": "x"}, tool_result("short")),
+            ({"url": "u", "compression_query": "x"}, tool_result(status="error")),
+            (
+                {"url": "u", "compression_query": "x"},
+                tool_result([{"type": "image", "url": "https://x/y.png"}, BIG_RESULT]),
+            ),
+            ({"url": "u", "compression_query": "x"}, Command(update={})),
+        ],
+    )
+    def test_passes_result_through(
+        self, client: ScaledownClient, args: dict[str, Any], result: Any
+    ) -> None:
+        mw = ScaledownToolCompressionMiddleware(client=client)
+        handler = MagicMock(return_value=result)
+        with patch.object(ScaledownClient, "compress") as compress:
+            out = mw.wrap_tool_call(make_tool_request("fetch_page", args), handler)
+        compress.assert_not_called()
+        assert out is result
+        assert "compression_query" not in handler.call_args.args[0].tool_call["args"]
+
+    def test_untargeted_tool_keeps_args(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(tools=["fetch_page"], client=client)
+        request = make_tool_request("other", {"compression_query": "kept"})
+        handler = MagicMock(return_value=tool_result())
+        with patch.object(ScaledownClient, "compress") as compress:
+            mw.wrap_tool_call(request, handler)
+        compress.assert_not_called()
+        handler.assert_called_once_with(request)
+
+    @pytest.mark.parametrize(
+        "compress_kw",
+        [
+            {"side_effect": ScaledownAPIError("down")},
+            {"return_value": {"successful": False, "compressed_prompt": "x"}},
+        ],
+    )
+    def test_fails_open(
+        self, client: ScaledownClient, compress_kw: dict[str, Any]
+    ) -> None:
+        mw = ScaledownToolCompressionMiddleware(client=client)
+        original = tool_result()
+        handler = MagicMock(return_value=original)
+        with patch.object(ScaledownClient, "compress", **compress_kw):
+            result = mw.wrap_tool_call(
+                make_tool_request("fetch_page", {"url": "u", "compression_query": "x"}),
+                handler,
+            )
+        assert result is original
+
+    async def test_async(self, client: ScaledownClient) -> None:
+        mw = ScaledownToolCompressionMiddleware(client=client)
+
+        async def model_handler(request: Any) -> Any:
+            return request.tools
+
+        tools: Any = await mw.awrap_model_call(
+            make_model_request([fetch_page]), model_handler
+        )
+        assert "compression_query" in tools[0]["properties"]
+
+        seen: list[ToolCallRequest] = []
+
+        async def tool_handler(request: ToolCallRequest) -> ToolMessage:
+            seen.append(request)
+            return tool_result()
+
+        with patch.object(ScaledownClient, "compress", return_value=COMPRESSED):
+            result = await mw.awrap_tool_call(
+                make_tool_request("fetch_page", {"url": "u", "compression_query": "x"}),
+                tool_handler,
+            )
+        assert seen[0].tool_call["args"] == {"url": "u"}
+        assert isinstance(result, ToolMessage)
+        assert result.text.endswith("Refund window: 30 days.")
+
+    def test_in_agent(self, client: ScaledownClient) -> None:
+        """End to end: the model sees `compression_query`, the tool runs without it."""
+        bound: list[list[Any]] = []
+
+        class FakeToolModel(GenericFakeChatModel):
+            def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+                bound.append(list(tools))
+                return self
+
+        calls: list[dict[str, Any]] = []
+
+        @tool
+        def fetch(url: str) -> str:
+            """Fetch a web page."""
+            calls.append({"url": url})
+            return BIG_RESULT
+
+        model = FakeToolModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "fetch",
+                                "args": {
+                                    "url": "u",
+                                    "compression_query": "refund window",
+                                },
+                                "id": "call-1",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="30 days."),
+                ]
+            )
+        )
+        agent = create_agent(
+            model,
+            tools=[fetch],
+            middleware=[ScaledownToolCompressionMiddleware(client=client)],
+        )
+        with patch.object(ScaledownClient, "compress", return_value=COMPRESSED) as c:
+            result = agent.invoke({"messages": [HumanMessage(content="refunds?")]})
+
+        assert "compression_query" in bound[0][0]["properties"]
+        assert calls == [{"url": "u"}]
+        c.assert_called_once_with(BIG_RESULT, "refund window", rate="auto")
+        tool_message = next(m for m in result["messages"] if isinstance(m, ToolMessage))
+        assert tool_message.text.endswith("Refund window: 30 days.")
 
 
 # --------------------------------------------------------------------------

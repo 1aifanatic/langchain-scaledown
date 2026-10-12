@@ -5,6 +5,7 @@ from langchain_scaledown.middleware import (
     ScaledownCompressionMiddleware,
     ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
+    ScaledownToolCompressionMiddleware,
 )
 from langchain_scaledown.summarizer import ScaledownSummarizer
 
@@ -21,6 +22,7 @@ __all__ = [
     "ScaledownCompressionMiddleware",
     "ScaledownExtractionMiddleware",
     "ScaledownSummarizationMiddleware",
+    "ScaledownToolCompressionMiddleware",
     "ScaledownSummarizer",
     "__version__",
 ]
