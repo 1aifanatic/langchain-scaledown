@@ -134,3 +134,11 @@ class ScaledownClient:
             for key, value in results.items():
                 data.setdefault(key, value)
         return data
+
+
+def _resolve_client(
+    client: ScaledownClient | None, api_key: str | None, base_url: str | None
+) -> ScaledownClient:
+    if client is not None:
+        return client
+    return ScaledownClient(api_key=api_key, base_url=base_url)

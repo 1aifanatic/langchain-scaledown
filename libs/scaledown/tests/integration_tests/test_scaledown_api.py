@@ -125,11 +125,12 @@ def test_summarization_middleware_in_agent() -> None:
         history.append(HumanMessage(f"Question {i} about my refund for order A-1042."))
         history.append(FakeListChatModel(responses=[f"Answer {i}."]).invoke("x"))
     history.append(HumanMessage("So how long do I have?"))
+    model = FakeListChatModel(responses=["30 days."])
     agent = create_agent(
-        model=FakeListChatModel(responses=["30 days."]),
+        model=model,
         middleware=[
             ScaledownSummarizationMiddleware(
-                trigger=("messages", 10), keep=("messages", 2)
+                model, trigger=("messages", 10), keep=("messages", 2)
             )
         ],
     )
