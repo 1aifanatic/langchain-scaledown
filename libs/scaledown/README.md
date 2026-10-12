@@ -114,7 +114,7 @@ ScaledownSummarizationMiddleware(
 `ScaledownSummarizer` plugs ScaleDown into the existing summarization middleware via its
 `summarizer` argument. The middleware still decides when to summarize and what to keep
 (including fractional limits from the model profile); ScaleDown writes the summary in
-place of a second LLM call. It accepts a string or a list of messages.
+place of a second LLM call.
 
 By default it asks ScaleDown for the same sections as LangChain's summary prompt
 (session intent, summary, artifacts, next steps); pass `instructions=` to change that.
@@ -132,17 +132,34 @@ SummarizationMiddleware(
 )
 ```
 
-With Deep Agents, build the summarization middleware with the same summarizer. It keeps
-the name `SummarizationMiddleware`, so it replaces the default (history offloading,
-argument truncation and the `compact_conversation` tool keep working):
+Deep Agents has its own summarization middleware, which also saves the evicted history
+to a file the agent can read back. Keep it, and have ScaleDown write its summaries by
+passing a `ScaledownSummarizer`:
 
 ```python
 from deepagents import create_deep_agent
-from deepagents.middleware.summarization import create_summarization_middleware
+from deepagents.backends import StateBackend
+from deepagents.middleware.summarization import SummarizationMiddleware
+from langchain_scaledown import ScaledownSummarizer
 
-summarization = create_summarization_middleware(model, backend, summarizer=ScaledownSummarizer())
-agent = create_deep_agent(model=model, backend=backend, middleware=[summarization])
+backend = StateBackend()
+summarization = SummarizationMiddleware(
+    model="openai:gpt-6-luna",
+    backend=backend,
+    trigger=("fraction", 0.85),
+    keep=("fraction", 0.10),
+    summarizer=ScaledownSummarizer(),
+)
+agent = create_deep_agent(
+    model="openai:gpt-6-luna",
+    backend=backend,
+    middleware=[summarization],  # replaces the default summarization middleware
+)
 ```
+
+`ScaledownSummarizer` is a `Runnable` that takes a string or a list of messages and
+returns the summary, so it works anywhere a `summarizer=` is accepted, or on its own
+(`ScaledownSummarizer().invoke(text)`).
 
 > **Note:** `sd_summarize` is in private preview. Contact ScaleDown to enable it on your key.
 

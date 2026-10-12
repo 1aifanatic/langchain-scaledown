@@ -28,8 +28,8 @@ DEFAULT_INSTRUCTIONS = (
 class ScaledownSummarizer(Runnable[str | Sequence[BaseMessage], str]):
     """Summarize text or messages with ScaleDown's `sd_summarize`.
 
-    Pass it as the `summarizer` of LangChain's `SummarizationMiddleware` or of
-    Deep Agents' `create_summarization_middleware`. The middleware keeps
+    Pass it as the `summarizer` of LangChain's or Deep Agents'
+    `SummarizationMiddleware`. The middleware keeps
     deciding when to summarize and which messages to keep; ScaleDown writes the
     summary instead of a second LLM call.
 
