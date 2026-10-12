@@ -59,10 +59,12 @@ from langchain_scaledown import (
 )
 
 agent = create_agent(
-    "openai:gpt-4.1",
+    "openai:gpt-6-sol",
     tools=[...],
     middleware=[
-        ScaledownSummarizationMiddleware(trigger=("tokens", 4000), keep=("messages", 20)),
+        ScaledownSummarizationMiddleware(
+            "openai:gpt-6-sol", trigger=("tokens", 4000), keep=("messages", 20)
+        ),
         ScaledownExtractionMiddleware({
             "order_id": "Order number the customer mentions",
             "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
@@ -94,43 +96,30 @@ result["scaledown_extraction"]["fields"]
 
 ### Summarization (`sd_summarize`)
 
-A drop-in alternative to LangChain's built-in
+A drop-in for LangChain's built-in
 [`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware/built-in#summarization),
 with the same `trigger` / `keep` options. When the conversation crosses `trigger`,
 every message except the most recent ones selected by `keep` is replaced in state by a
 single ScaleDown summary. Each stretch of history is summarized once. Tool results are
 never separated from the call that requested them.
 
+Pass your agent's model. It's used for its context window (for `"fraction"` limits) and
+for token counting, never to write summaries.
+
 ```python
 ScaledownSummarizationMiddleware(
-    trigger=("tokens", 4000),   # or ("messages", 50), or a list: summarize when any is hit
-    keep=("messages", 20),      # or ("tokens", 2000)
+    "openai:gpt-6-sol",
+    trigger=("fraction", 0.8),  # or ("tokens", 4000), ("messages", 50), or a list of these
+    keep=("fraction", 0.1),     # or ("messages", 20), ("tokens", 2000)
     instructions="Keep order numbers and dates.",  # optional, passed to ScaleDown
 )
 ```
 
-#### `ScaledownSummarizer` with LangChain and Deep Agents
+By default ScaleDown is asked for the same sections as LangChain's summary prompt
+(session intent, summary, artifacts, next steps), and all of the older history is sent
+(`trim_tokens_to_summarize=None`).
 
-`ScaledownSummarizer` plugs ScaleDown into the existing summarization middleware via its
-`summarizer` argument. The middleware still decides when to summarize and what to keep
-(including fractional limits from the model profile); ScaleDown writes the summary in
-place of a second LLM call.
-
-By default it asks ScaleDown for the same sections as LangChain's summary prompt
-(session intent, summary, artifacts, next steps); pass `instructions=` to change that.
-
-```python
-from langchain.agents.middleware import SummarizationMiddleware
-from langchain_scaledown import ScaledownSummarizer
-
-SummarizationMiddleware(
-    "openai:gpt-6-luna",              # used for its profile and token counting
-    trigger=("fraction", 0.8),
-    keep=("fraction", 0.1),
-    trim_tokens_to_summarize=None,    # send all older history to ScaleDown
-    summarizer=ScaledownSummarizer(),
-)
-```
+#### With Deep Agents
 
 Deep Agents has its own summarization middleware, which also saves the evicted history
 to a file the agent can read back. Keep it, and have ScaleDown write its summaries by
@@ -144,14 +133,14 @@ from langchain_scaledown import ScaledownSummarizer
 
 backend = StateBackend()
 summarization = SummarizationMiddleware(
-    model="openai:gpt-6-luna",
+    model="openai:gpt-6-sol",
     backend=backend,
     trigger=("fraction", 0.85),
     keep=("fraction", 0.10),
     summarizer=ScaledownSummarizer(),
 )
 agent = create_deep_agent(
-    model="openai:gpt-6-luna",
+    model="openai:gpt-6-sol",
     backend=backend,
     middleware=[summarization],  # replaces the default summarization middleware
 )

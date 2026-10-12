@@ -59,10 +59,12 @@ from langchain_scaledown import (
 )
 
 agent = create_agent(
-    "openai:gpt-4.1",
+    "openai:gpt-6-sol",
     tools=[...],
     middleware=[
-        ScaledownSummarizationMiddleware(trigger=("tokens", 4000), keep=("messages", 20)),
+        ScaledownSummarizationMiddleware(
+            "openai:gpt-6-sol", trigger=("tokens", 4000), keep=("messages", 20)
+        ),
         ScaledownExtractionMiddleware({
             "order_id": "Order number the customer mentions",
             "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
@@ -103,6 +105,7 @@ never separated from the call that requested them.
 
 ```python
 ScaledownSummarizationMiddleware(
+    "openai:gpt-6-sol",         # your agent's model: used for its context window and token counting
     trigger=("tokens", 4000),   # or ("messages", 50), or a list: summarize when any is hit
     keep=("messages", 20),      # or ("tokens", 2000)
     instructions="Keep order numbers and dates.",  # optional, passed to ScaleDown

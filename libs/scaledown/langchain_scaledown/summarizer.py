@@ -8,8 +8,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage, get_buffer_string
 from langchain_core.runnables import Runnable, RunnableConfig
 
-from langchain_scaledown._client import ScaledownClient
-from langchain_scaledown.middleware import _resolve_client
+from langchain_scaledown._client import ScaledownClient, _resolve_client
 
 DEFAULT_INSTRUCTIONS = (
     "This summary replaces an AI agent's conversation history, and the agent "
@@ -60,11 +59,11 @@ class ScaledownSummarizer(Runnable[str | Sequence[BaseMessage], str]):
         from langchain_scaledown import ScaledownSummarizer
 
         agent = create_agent(
-            "openai:gpt-6-luna",
+            "openai:gpt-6-sol",
             tools=[...],
             middleware=[
                 SummarizationMiddleware(
-                    "openai:gpt-6-luna",
+                    "openai:gpt-6-sol",
                     trigger=("fraction", 0.8),
                     keep=("fraction", 0.1),
                     trim_tokens_to_summarize=None,
